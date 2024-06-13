@@ -18,6 +18,7 @@ CNewBoxWizard::CNewBoxWizard(bool bAlowTemp, QWidget *parent)
 {
     setPage(Page_Type, new CBoxTypePage(bAlowTemp));
     setPage(Page_Files, new CFilesPage);
+    setPage(Page_Isolation, new CIsolationPage);
     setPage(Page_Advanced, new CAdvancedPage);
     setPage(Page_Summary, new CSummaryPage);
     
@@ -95,104 +96,195 @@ SB_STATUS CNewBoxWizard::TryToCreateBox()
 	if (!Status.IsError())
 	{
 		CSandBoxPtr pBox = theAPI->GetBoxByName(BoxName);
+		
+        // SharedTemplate
+        QElapsedTimer timer;
+        timer.start();
+        const QString templateName = "SharedTemplate";
+        const QString templateFullName = "Template_Local_" + templateName;
+        const QString templateSettings = theAPI->SbieIniGetEx(templateFullName, "");
+        const QStringList templateSettingsLines = templateSettings.split(QRegularExpression(QStringLiteral("[\r\n]")), Qt::SkipEmptyParts);
+        const QString templateComment = tr("Add your settings after this line.");
+        const QString templateTitle = tr("Shared Template");
+        const QString boxSettings = theAPI->SbieIniGetEx(BoxName, "");
+        const QStringList boxSettingsLines = boxSettings.split(QRegularExpression(QStringLiteral("[\r\n]")), Qt::SkipEmptyParts);
+        const QStringList SPECIAL_SETTINGS = { "BorderColor", "BoxIcon", "BoxNameTitle", "ConfigLevel", "CopyLimitKb" };
 
-		switch (BoxType)
-		{
-			case CSandBoxPlus::eHardenedPlus:
-                pBox->SetBool("UsePrivacyMode", true);
-			case CSandBoxPlus::eHardened:
-				pBox->SetBool("UseSecurityMode", true);
-				break;
+        bool disableWizardSettings = templateSettings.contains(QRegularExpression(QStringLiteral("[\r\n]#DisableWizardSettings=y[\r\n]")));
+        bool removeDefaultAll = templateSettings.contains(QRegularExpression(QStringLiteral("[\r\n]#RemoveDefaultAll=y[\r\n]")));
+        bool removeDefaultRecovers = templateSettings.contains(QRegularExpression(QStringLiteral("[\r\n]#RemoveDefaultRecovers=y[\r\n]")));
+        bool removeDefaultTemplates = templateSettings.contains(QRegularExpression(QStringLiteral("[\r\n]#RemoveDefaultTemplates=y[\r\n]")));
 
-			case CSandBoxPlus::eDefaultPlus:
-                pBox->SetBool("UsePrivacyMode", true);
-			case CSandBoxPlus::eDefault:
-				break;
+        int sharedTemplateMode = field("sharedTemplate").toInt();
 
-			case CSandBoxPlus::eAppBoxPlus:
-                pBox->SetBool("UsePrivacyMode", true);
-			case CSandBoxPlus::eAppBox:
-				pBox->SetBool("NoSecurityIsolation", true);
-				//pBox->InsertText("Template", "NoUACProxy"); // proxy is always needed for exes in the box
-				pBox->InsertText("Template", "RpcPortBindingsExt");
-				break;
-		}
-
-        if (BlackBox) {
-            pBox->SetBool("UseFileImage", true);
-            pBox->SetBool("ConfidentialBox", true);
+        // Create base template
+        if (templateSettings.isEmpty() && sharedTemplateMode != 0) {
+            const QString templateBase = QStringLiteral("Tmpl.Title=%1\nTmpl.Class=Local\n%3=n\n%4=n\n%5=n\n%6=n\nTmpl.Comment=%2")
+                .arg(templateTitle, templateComment, "#DisableWizardSettings", "#RemoveDefaultAll", "#RemoveDefaultRecovers", "#RemoveDefaultTemplates");
+            theAPI->SbieIniSet(templateFullName, "", templateBase);
         }
 
-		QRgb rgb = theGUI->GetBoxColor(BoxType);
-		pBox->SetText("BorderColor", QString("#%1%2%3").arg(qBlue(rgb), 2, 16, QChar('0')).arg(qGreen(rgb), 2, 16, QChar('0')).arg(qRed(rgb), 2, 16, QChar('0')) + ",ttl");
-
-
-        QString Location = field("boxLocation").toString();
-        if (!Location.isEmpty()) {
-            pBox->SetText("FileRootPath", Location);
-            theAPI->UpdateBoxPaths(pBox.data());
+        switch (sharedTemplateMode)
+        {
+        case 1:
+        case 2:
+        case 3:
+            // Remove default settings
+            if (removeDefaultRecovers || removeDefaultAll) {
+                pBox->DelValue("RecoverFolder");
+            }
+            if (removeDefaultTemplates || removeDefaultAll) {
+                pBox->DelValue("Template");
+            }
+            if (removeDefaultAll) {
+                for (const QString& bLine : boxSettingsLines) {
+                    int bParts = bLine.indexOf("=", Qt::SkipEmptyParts);
+                    if (bParts != -1) {
+                        const QString bKey = bLine.mid(0, bParts).trimmed();
+                        const QString bValue = bLine.mid(bParts + 1).trimmed();
+                        if (bKey.compare("Enabled", Qt::CaseInsensitive) != 0 && bKey.compare("ConfigLevel") != 0) { // Do not remove Enabled and ConfigLevel
+                            pBox->DelValue(bKey, bValue);
+                        }
+                    }
+                }
+            }
+            break;
+        default:
+            // Default case
+            break;
         }
-
-        if (field("boxVersion").toInt() == 1) {
-            pBox->SetBool("UseFileDeleteV2", true);
-			pBox->SetBool("UseRegDeleteV2", true);
+        if (sharedTemplateMode == 1) { // Insert as template
+            const QString insertValue = templateFullName.mid(9); // Template_
+            pBox->InsertText("Template", insertValue);
         }
-        if(!field("separateUser").toBool())
-            pBox->SetBool("SeparateUserFolders", false);
-        if(field("useVolumeSN").toBool())
-            pBox->SetBool("UseVolumeSerialNumbers", true);
-        
-        if (field("autoRemove").toBool()) {
-            pBox->SetBool("AutoDelete", true);
-            pBox->SetBool("AutoRemove", true);
-        }
-        else if(field("autoDelete").toBool())
-            pBox->SetBool("AutoDelete", true);
-        if(field("autoRecover").toBool())
-            pBox->SetBool("AutoRecover", true);
+        else if (sharedTemplateMode == 2) { // Append template settings to configuration
+            for (const QString& tLine : templateSettingsLines) {
+                int tParts = tLine.indexOf("=", Qt::SkipEmptyParts);
+                if (tParts == -1) {
+                    continue; // Skip lines that don't have at least one '=' character.
+                }
+                const QString tKey = tLine.mid(0, tParts).trimmed();
+                const QString tValue = tLine.mid(tParts + 1).trimmed();
+                if (tKey.compare("Enabled", Qt::CaseInsensitive) == 0 || tKey.startsWith("Tmpl.") || tKey.startsWith("#") || tKey.endsWith("Disabled")) {
+                    continue; // Skip lines that start or end with one of these
+                }
 
-        if (field("blockNetwork").toInt() == 1) { // device based
-            //pBox->InsertText("AllowNetworkAccess", "<BlockNetAccess>,n");
-            pBox->InsertText("ClosedFilePath", "!<InternetAccess>,InternetAccessDevices");
-            //pBox->InsertText("ClosedFilePath", "<BlockNetDevices>,InternetAccessDevices");
-        }
-        else if (field("blockNetwork").toInt() == 2) { // using WFP
-            pBox->InsertText("AllowNetworkAccess", "!<InternetAccess>,n");
-            //pBox->InsertText("AllowNetworkAccess", "<BlockNetAccess>,n");
-            //pBox->InsertText("ClosedFilePath", "<BlockNetDevices>,InternetAccessDevices");
-        }
-        pBox->SetBool("BlockNetworkFiles", !field("shareAccess").toBool());
-
-        if (field("fakeAdmin").toBool()) {
-            pBox->SetBool("DropAdminRights", true);
-            pBox->SetBool("FakeAdminRights", true);
-        }
-        if(field("msiServer").toBool())
-            pBox->SetBool("MsiInstallerExemptions", true);
-
-        if(field("boxToken").toBool())
-            pBox->SetBool("SandboxieLogon", true);
-
-        if(field("imagesProtection").toBool())
-            pBox->SetBool("ProtectHostImages", true);
-
-        if (!Password.isEmpty())
-            pBox->ImBoxCreate(ImageSize / 1024, Password);
-
-        if (field("boxVersion").toInt() == 1) {
-            if (theConf->GetBool("Options/WarnDeleteV2", true)) {
-                bool State = false;
-                CCheckableMessageBox::question(this, "Sandboxie-Plus",
-                    tr("The new sandbox has been created using the new <a href=\"https://sandboxie-plus.com/go.php?to=sbie-delete-v2\">Virtualization Scheme Version 2</a>, if you experience any unexpected issues with this box,"
-                        " please switch to the Virtualization Scheme to Version 1 and report the issue,"
-                        " the option to change this preset can be found in the Box Options in the Box Structure group.")
-                    , tr("Don't show this message again."), &State, QDialogButtonBox::Ok, QDialogButtonBox::Ok, QMessageBox::Information);
-
-                if (State)
-                    theConf->SetValue("Options/WarnDeleteV2", false);
+                if (tValue.compare("y", Qt::CaseInsensitive) == 0 || tValue.compare("n", Qt::CaseInsensitive) == 0 || SPECIAL_SETTINGS.contains(tKey)) {
+                    pBox->SetText(tKey, tValue);
+                }
+                else {
+                    pBox->AppendText(tKey, tValue);
+                }
             }
         }
-	}
+        qDebug().noquote().nospace() << templateName << " (Mode = " << sharedTemplateMode << ") operation took " << timer.elapsed() << " ms";
+        //
+        if (!disableWizardSettings || sharedTemplateMode == 0) {
+		    switch (BoxType)
+		    {
+		    	case CSandBoxPlus::eHardenedPlus:
+                    pBox->SetBool("UsePrivacyMode", true);
+		    	case CSandBoxPlus::eHardened:
+		    		pBox->SetBool("UseSecurityMode", true);
+		    		break;
+		    
+		    	case CSandBoxPlus::eDefaultPlus:
+                    pBox->SetBool("UsePrivacyMode", true);
+		    	case CSandBoxPlus::eDefault:
+		    		break;
+		    
+		    	case CSandBoxPlus::eAppBoxPlus:
+                    pBox->SetBool("UsePrivacyMode", true);
+		    	case CSandBoxPlus::eAppBox:
+		    		pBox->SetBool("NoSecurityIsolation", true);
+		    		//pBox->InsertText("Template", "NoUACProxy"); // proxy is always needed for exes in the box
+		    		pBox->InsertText("Template", "RpcPortBindingsExt");
+		    		break;
+		    }
+		    
+            if (BlackBox) {
+                pBox->SetBool("UseFileImage", true);
+                pBox->SetBool("ConfidentialBox", true);
+            }
+		    
+		    QRgb rgb = theGUI->GetBoxColor(BoxType);
+		    pBox->SetText("BorderColor", QString("#%1%2%3").arg(qBlue(rgb), 2, 16, QChar('0')).arg(qGreen(rgb), 2, 16, QChar('0')).arg(qRed(rgb), 2, 16, QChar('0')) + ",ttl");
+		    
+		    
+            QString Location = field("boxLocation").toString();
+            if (!Location.isEmpty()) {
+                pBox->SetText("FileRootPath", Location);
+                theAPI->UpdateBoxPaths(pBox.data());
+            }
+		    
+            if (field("boxVersion").toInt() == 1) {
+                pBox->SetBool("UseFileDeleteV2", true);
+		    	pBox->SetBool("UseRegDeleteV2", true);
+            }
+            if(!field("separateUser").toBool())
+                pBox->SetBool("SeparateUserFolders", false);
+            if(field("useVolumeSN").toBool())
+                pBox->SetBool("UseVolumeSerialNumbers", true);
+            
+            if (field("autoRemove").toBool()) {
+                pBox->SetBool("AutoDelete", true);
+                pBox->SetBool("AutoRemove", true);
+            }
+            else if(field("autoDelete").toBool())
+                pBox->SetBool("AutoDelete", true);
+            if(field("autoRecover").toBool())
+                pBox->SetBool("AutoRecover", true);
+		    
+            if (field("blockNetwork").toInt() == 1) { // device based
+                //pBox->InsertText("AllowNetworkAccess", "<BlockNetAccess>,n");
+                pBox->InsertText("ClosedFilePath", "!<InternetAccess>,InternetAccessDevices");
+                //pBox->InsertText("ClosedFilePath", "<BlockNetDevices>,InternetAccessDevices");
+            }
+            else if (field("blockNetwork").toInt() == 2) { // using WFP
+                pBox->InsertText("AllowNetworkAccess", "!<InternetAccess>,n");
+                //pBox->InsertText("AllowNetworkAccess", "<BlockNetAccess>,n");
+                //pBox->InsertText("ClosedFilePath", "<BlockNetDevices>,InternetAccessDevices");
+            }
+            pBox->SetBool("BlockNetworkFiles", !field("shareAccess").toBool());
+
+            bool bHardened = (BoxType == CSandBoxPlus::eHardenedPlus || BoxType == CSandBoxPlus::eHardened);
+            bool bDropAdmin = field("dropAdmin").toBool();
+            if (field("dropAdmin").toBool() && !bHardened)
+                pBox->SetBool("DropAdminRights", true);
+
+            if (field("fakeAdmin").toBool())
+                pBox->SetBool("FakeAdminRights", true);
+
+            if(field("msiServer").toBool() && !bDropAdmin && !bHardened)
+                pBox->SetBool("MsiInstallerExemptions", true);
+
+            if(field("boxToken").toBool())
+                pBox->SetBool("SandboxieLogon", true);
+
+            if(field("imagesProtection").toBool())
+                pBox->SetBool("ProtectHostImages", true);
+
+            if (field("coverBoxedWindows").toBool())
+                pBox->SetBool("CoverBoxedWindows", true);
+
+            if (!Password.isEmpty())
+                pBox->ImBoxCreate(ImageSize / 1024, Password);
+
+            if (field("boxVersion").toInt() == 1) {
+                if (theConf->GetBool("Options/WarnDeleteV2", true)) {
+                    bool State = false;
+                    CCheckableMessageBox::question(this, "Sandboxie-Plus",
+                        tr("The new sandbox has been created using the new <a href=\"https://sandboxie-plus.com/go.php?to=sbie-delete-v2\">Virtualization Scheme Version 2</a>, if you experience any unexpected issues with this box,"
+                            " please switch to the Virtualization Scheme to Version 1 and report the issue,"
+                            " the option to change this preset can be found in the Box Options in the Box Structure group.")
+                        , tr("Don't show this message again."), &State, QDialogButtonBox::Ok, QDialogButtonBox::Ok, QMessageBox::Information);
+		    
+                    if (State)
+                        theConf->SetValue("Options/WarnDeleteV2", false);
+                }
+            }
+        }
+    }
 
     return Status;
 }
@@ -574,7 +666,7 @@ CFilesPage::CFilesPage(QWidget *parent)
 
 int CFilesPage::nextId() const
 {
-    return CNewBoxWizard::Page_Advanced;
+    return CNewBoxWizard::Page_Isolation;
 }
     
 void CFilesPage::initializePage()
@@ -611,14 +703,14 @@ bool CFilesPage::validatePage()
 
 
 //////////////////////////////////////////////////////////////////////////////////////////
-// CAdvancedPage
+// CIsolationPage
 // 
 
-CAdvancedPage::CAdvancedPage(QWidget *parent)
+CIsolationPage::CIsolationPage(QWidget *parent)
     : QWizardPage(parent)
 {
-    setTitle(tr("Advanced Sandbox options"));
-    setSubTitle(tr("On this page advanced sandbox options can be configured."));
+    setTitle(tr("Sandbox Isolation options"));
+    setSubTitle(tr("On this page sandbox isolation options can be configured."));
 
     int row = 0;
     QGridLayout *layout = new QGridLayout;
@@ -650,6 +742,12 @@ CAdvancedPage::CAdvancedPage(QWidget *parent)
     pAdminLabel->setFont(fnt);
     layout->addWidget(pAdminLabel, row++, 0);
 
+    m_pDropAdmin = new QCheckBox(tr("Drop rights from Administrators and Power Users groups"));
+    m_pDropAdmin->setChecked(theConf->GetBool("BoxDefaults/DropAdmin", false));
+    layout->addWidget(m_pDropAdmin, row++, 1, 1, 3);
+    connect(m_pDropAdmin, &QCheckBox::stateChanged, this, &CIsolationPage::OnDropAdminChanged);
+    registerField("dropAdmin", m_pDropAdmin);
+
     QCheckBox* pFakeAdmin = new QCheckBox(tr("Make applications think they are running elevated"));
     pFakeAdmin->setChecked(theConf->GetBool("BoxDefaults/FakeAdmin", false));
     layout->addWidget(pFakeAdmin, row++, 1, 1, 3);
@@ -657,7 +755,8 @@ CAdvancedPage::CAdvancedPage(QWidget *parent)
 
     m_pMSIServer = new QCheckBox(tr("Allow MSIServer to run with a sandboxed system token"));
     m_pMSIServer->setToolTip(tr("This option is not recommended for Hardened boxes"));
-    m_pMSIServer->setChecked(theConf->GetBool("BoxDefaults/MsiExemptions", false));
+    if (!theConf->GetBool("BoxDefaults/DropAdmin", false))
+        m_pMSIServer->setChecked(theConf->GetBool("BoxDefaults/MsiExemptions", false));
     layout->addWidget(m_pMSIServer, row++, 1, 1, 3);
     registerField("msiServer", m_pMSIServer);
 
@@ -671,15 +770,7 @@ CAdvancedPage::CAdvancedPage(QWidget *parent)
     layout->addWidget(m_pBoxToken, row++, 1, 1, 3);
     registerField("boxToken", m_pBoxToken);
 
-    QCheckBox* pImageProtection = new QCheckBox(tr("Prevent sandboxes programs installed on host from loading dll's from the sandbox"));
-    pImageProtection->setToolTip(tr("This feature may reduce compatibility as it also prevents box located processes from writing to host located ones and even starting them."));
-    pImageProtection->setChecked(theConf->GetBool("BoxDefaults/ImagesProtection", false));
-    pImageProtection->setEnabled(g_CertInfo.active);
-    layout->addWidget(pImageProtection, row++, 1, 1, 3);
-    registerField("imagesProtection", pImageProtection);
-
     setLayout(layout);
-
 
 	int size = 16.0;
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
@@ -690,6 +781,113 @@ CAdvancedPage::CAdvancedPage(QWidget *parent)
     AddIconToLabel(pBoxLabel, CSandMan::GetIcon("Sandbox").pixmap(size,size));
 }
 
+int CIsolationPage::nextId() const
+{
+    return CNewBoxWizard::Page_Advanced;
+}
+    
+void CIsolationPage::initializePage()
+{
+    int BoxType = wizard()->field("boxType").toInt();
+
+    bool bHardened = (BoxType == CSandBoxPlus::eHardenedPlus || BoxType == CSandBoxPlus::eHardened);
+    bool bDropAdmin = field("dropAdmin").toBool();
+    m_pMSIServer->setEnabled(!bHardened && !bDropAdmin);
+    m_pShareAccess->setEnabled(!bHardened);
+    m_pDropAdmin->setEnabled(!bHardened);
+    m_pDropAdmin->setChecked(bDropAdmin || bHardened);
+
+    bool bAppBox = (BoxType == CSandBoxPlus::eAppBoxPlus || BoxType == CSandBoxPlus::eAppBox);
+    m_pBoxToken->setEnabled(!bAppBox);
+}
+
+bool CIsolationPage::validatePage()
+{
+    return true;
+}
+
+void CIsolationPage::OnDropAdminChanged(int state) {
+    // If m_pDropAdmin is checked, disable m_pMSIServer
+    if (state == Qt::Checked) {
+        m_pMSIServer->setEnabled(false);
+        m_pMSIServer->setChecked(false);
+    }
+    else {
+        // If m_pDropAdmin is unchecked, enable m_pMSIServer
+        m_pMSIServer->setEnabled(true);
+    }
+}
+
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// CAdvancedPage
+// 
+
+CAdvancedPage::CAdvancedPage(QWidget *parent)
+    : QWizardPage(parent)
+{
+    setTitle(tr("Advanced Sandbox options"));
+    setSubTitle(tr("On this page advanced sandbox options can be configured."));
+
+    int row = 0;
+    QGridLayout *layout = new QGridLayout;
+
+    QLabel* pBoxLabel = new QLabel(tr("Advanced Options"), this);
+    QFont fnt = pBoxLabel->font();
+	fnt.setBold(true);
+	//fnt.setWeight(QFont::DemiBold);
+    pBoxLabel->setFont(fnt);
+    layout->addWidget(pBoxLabel, row++, 0);
+
+    QCheckBox* pImageProtection = new QCheckBox(tr("Prevent sandboxed programs on the host from loading sandboxed DLLs"));
+    pImageProtection->setToolTip(tr("This feature may reduce compatibility as it also prevents box located processes from writing to host located ones and even starting them."));
+    pImageProtection->setChecked(theConf->GetBool("BoxDefaults/ImagesProtection", false));
+    pImageProtection->setEnabled(g_CertInfo.active);
+    layout->addWidget(pImageProtection, row++, 1, 1, 3);
+    registerField("imagesProtection", pImageProtection);
+
+	QCheckBox* pWindowCover = new QCheckBox(tr("Prevent sandboxed windows from being captured"));
+	pWindowCover->setToolTip(tr("This feature can cause a decline in the user experience because it also prevents normal screenshots."));
+	pWindowCover->setChecked(theConf->GetBool("BoxDefaults/CoverBoxedWindows", false));
+	layout->addWidget(pWindowCover, row++, 1, 1, 3);
+	registerField("coverBoxedWindows", pWindowCover);
+
+	QString SharedTemplateName = tr("Shared Template");
+	QLabel* pSharedTemplateLbl = new QLabel(tr("Shared template mode"), this);
+    pSharedTemplateLbl->setToolTip(tr("This setting adds a local template or its settings to the sandbox configuration so that the settings in that template are shared between sandboxes."
+        "\nHowever, if 'use as a template' option is selected as the sharing mode, some settings may not be reflected in the user interface."
+        "\nTo change the template's settings, simply locate the '%1' template in the App Templates list under Sandbox Options, then double-click on it to edit it."
+        "\nTo disable this template for a sandbox, simply uncheck it in the template list.").arg(SharedTemplateName));
+    layout->addWidget(pSharedTemplateLbl, row, 1);
+
+    QString SharedTemplateTip0 = tr("This option does not add any settings to the box configuration and does not remove the default box settings based on the removal settings within the template.");
+    QString SharedTemplateTip1 = tr("This option adds the shared template to the box configuration as a local template and may also remove the default box settings based on the removal settings within the template.");
+    QString SharedTemplateTip2 = tr("This option adds the settings from the shared template to the box configuration and may also remove the default box settings based on the removal settings within the template.");
+    QString SharedTemplateTip3 = tr("This option does not add any settings to the box configuration, but may remove the default box settings based on the removal settings within the template.");
+    QComboBox* pSharedTemplate = new QComboBox();
+    pSharedTemplate->addItem(tr("Disabled"));
+    pSharedTemplate->setItemData(0, SharedTemplateTip0, Qt::ToolTipRole);
+    pSharedTemplate->addItem(tr("Use as a template"));
+    pSharedTemplate->setItemData(1, SharedTemplateTip1, Qt::ToolTipRole);
+    pSharedTemplate->addItem(tr("Append to the configuration"));
+    pSharedTemplate->setItemData(2, SharedTemplateTip2, Qt::ToolTipRole);
+    pSharedTemplate->addItem(tr("Remove defaults if set"));
+    pSharedTemplate->setItemData(3, SharedTemplateTip3, Qt::ToolTipRole);
+    layout->addWidget(pSharedTemplate, row++, 2);
+    pSharedTemplate->setCurrentIndex(theConf->GetInt("BoxDefaults/SharedTemplate", 0));
+    layout->addItem(new QSpacerItem(40, 20, QSizePolicy::Expanding, QSizePolicy::Minimum), 0, 4, 1, 1);
+    registerField("sharedTemplate", pSharedTemplate);
+
+    setLayout(layout);
+
+
+	int size = 16.0;
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+	size *= (QApplication::desktop()->logicalDpiX() / 96.0); // todo Qt6
+#endif
+    AddIconToLabel(pBoxLabel, CSandMan::GetIcon("Advanced").pixmap(size,size));
+}
+
 int CAdvancedPage::nextId() const
 {
     return CNewBoxWizard::Page_Summary;
@@ -697,14 +895,6 @@ int CAdvancedPage::nextId() const
     
 void CAdvancedPage::initializePage()
 {
-    int BoxType = wizard()->field("boxType").toInt();
-
-    bool bHardened = (BoxType == CSandBoxPlus::eHardenedPlus || BoxType == CSandBoxPlus::eHardened);
-    m_pMSIServer->setEnabled(!bHardened);
-    m_pShareAccess->setEnabled(!bHardened);
-
-    bool bAppBox = (BoxType == CSandBoxPlus::eAppBoxPlus || BoxType == CSandBoxPlus::eAppBox);
-    m_pBoxToken->setEnabled(!bAppBox);
 }
 
 bool CAdvancedPage::validatePage()
@@ -804,11 +994,14 @@ bool CSummaryPage::validatePage()
         theConf->SetValue("BoxDefaults/BlockNetwork", field("blockNetwork").toInt());
         theConf->SetValue("BoxDefaults/ShareAccess", field("shareAccess").toBool());
 
+        theConf->SetValue("BoxDefaults/DropAdmin", field("dropAdmin").toBool());
         theConf->SetValue("BoxDefaults/FakeAdmin", field("fakeAdmin").toBool());
         theConf->SetValue("BoxDefaults/MsiExemptions", field("msiServer").toBool());
 
         theConf->SetValue("BoxDefaults/BoxToken", field("boxToken").toBool());
         theConf->SetValue("BoxDefaults/ImagesProtection", field("imagesProtection").toBool());
+		theConf->SetValue("BoxDefaults/CoverBoxedWindows", field("coverBoxedWindows").toBool());
+        theConf->SetValue("BoxDefaults/SharedTemplate", field("sharedTemplate").toInt());
     }
 
     theConf->SetValue("Options/InstantBoxWizard", m_pSetInstant->isChecked());
